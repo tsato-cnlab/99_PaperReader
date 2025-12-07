@@ -6,6 +6,8 @@ A Streamlit app to summarize papers from Zotero collections using Gemini LLM.
 
 import os
 import re
+import time
+import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import streamlit as st
@@ -13,12 +15,7 @@ from pyzotero import zotero
 import pymupdf4llm
 import google.generativeai as genai
 from dotenv import load_dotenv
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_fixed,
-    retry_if_exception_type
-)
+from notion_client import Client
 
 # Load environment variables
 load_dotenv()
@@ -33,11 +30,14 @@ DEFAULT_ZOTERO_STORAGE = os.getenv(
 OUTPUT_DIR = Path("./output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Two-stage model configuration
-FLASH_MODEL = "gemini-2.0-flash-exp"  # Fast information extraction
-PRO_MODEL = "gemini-2.0-pro-exp"      # Advanced reasoning
-MAX_RETRIES = 5
-RETRY_WAIT_SECONDS = 50  # Increased from 40 to handle quota delays
+# Model configuration (simplified to single-stage)
+GEMINI_MODEL = "gemini-flash-lite-latest"  # Cost-efficient model
+GEMINI_MODEL = "gemini-2.5-flash-tts"  # Cost-efficient model
+RATE_LIMIT_DELAY = 4  # seconds between API calls
+
+# Notion configuration
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
 
 # ==================== Helper Functions ====================
@@ -202,15 +202,9 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-@retry(
-    retry=retry_if_exception_type(Exception),
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_WAIT_SECONDS),
-    reraise=True
-)
-def extract_paper_info(text: str, api_key: str, title: str) -> str:
+def analyze_paper_with_gemini(text: str, api_key: str, title: str) -> Dict:
     """
-    Stage 1: Extract high-resolution information using Flash model with retry logic.
+    Analyze paper and generate structured JSON output for Notion.
     
     Args:
         text: Paper content in markdown
@@ -218,126 +212,147 @@ def extract_paper_info(text: str, api_key: str, title: str) -> str:
         title: Paper title for context
     
     Returns:
-        Detailed extracted information
+        Dictionary with 'score', 'novelty', and 'category' keys
     """
     genai.configure(api_key=api_key)
-    flash_model = genai.GenerativeModel(FLASH_MODEL)
-    
-    extraction_prompt = f"""
-あなたは上位モデルへ情報を渡すための「高解像度情報抽出器」です。
-
-論文タイトル: {title}
-
-以下の論文テキストから、一切の情報を省略せず、以下の要素を構造化して抽出してください:
-
-1. **研究の核心的な目的と新規性**
-2. **提案手法の技術的詳細**（数式、アルゴリズム、アーキテクチャ）
-3. **実験設定の詳細**（データセット、評価メトリクス、ベースライン）
-4. **実験結果の具体的な数値**（SOTA比較、アブレーション）
-5. **議論と限界点**
-
-重要: 要約せず、Proモデルが原文を読んだのと同じレベルで推論できるよう詳細に記述してください。
-
----
-
-{text[:100000]}
-
----
-
-上記の論文から高解像度の情報を抽出してください。
-"""
-    
-    try:
-        response = flash_model.generate_content(extraction_prompt)
-        return response.text
-    except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-            # Extract retry delay from error message if available
-            import re
-            retry_match = re.search(r'retry in (\d+\.?\d*)', error_msg)
-            suggested_wait = int(float(retry_match.group(1))) if retry_match else RETRY_WAIT_SECONDS
-            
-            st.warning(f"⏳ Flash model rate limit: Will retry in {max(suggested_wait, RETRY_WAIT_SECONDS)}s...")
-            raise  # Let tenacity handle retry
-        raise RuntimeError(f"Flash model error: {e}")
-
-
-@retry(
-    retry=retry_if_exception_type(Exception),
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_WAIT_SECONDS),
-    reraise=True
-)
-def summarize_paper(extracted_info: str, api_key: str, title: str) -> str:
-    """
-    Stage 2: Generate detailed summary using Pro model with retry logic.
-    
-    Args:
-        extracted_info: Information extracted in Stage 1
-        api_key: Gemini API key
-        title: Paper title for context
-    
-    Returns:
-        Summary text in markdown
-    """
-    genai.configure(api_key=api_key)
-    pro_model = genai.GenerativeModel(PRO_MODEL)
+    model = genai.GenerativeModel(GEMINI_MODEL)
     
     prompt = f"""
-あなたは研究論文の専門家AIです。
+あなたは研究論文を評価する専門家AIです。
 
-以下に論文から抽出された詳細情報があります。
-これを基に、構造化された要約を作成してください。
-
-## 要約の構成
-
-1. **背景と動機**: この論文が解決する問題は?
-2. **主要な貢献**: 重要な革新や発見は?
-3. **手法**: アプローチの詳細（数式・アルゴリズム含む）
-4. **実験結果**: 主要な実験結果と数値
-5. **結論と今後の課題**: 要点と次のステップ
-
----
+以下の論文を分析し、JSON形式で結果を出力してください。
 
 ## 論文タイトル
 {title}
 
-## 抽出された詳細情報
-
-{extracted_info}
+## 論文内容
+{text[:80000]}
 
 ---
 
-Markdown形式で詳細な要約を作成してください。
+## 出力形式（必ずこのJSON形式で出力してください）
+
+{{
+  "score": <0-100の整数スコア>,
+  "novelty": "<新規性の要約を200文字程度で記述>",
+  "category": "<論文のカテゴリ（例: 機械学習、コンピュータビジョン、自然言語処理など）>"
+}}
+
+## 評価基準
+
+- **score**: 論文の重要性・影響力を0-100で評価
+  - 90-100: 画期的な成果
+  - 70-89: 非常に優れた研究
+  - 50-69: 良好な研究
+  - 30-49: 平均的な研究
+  - 0-29: 限定的な貢献
+
+- **novelty**: 新規性の要点を簡潔に要約
+
+- **category**: 論文の主要な研究分野。例：（Generative Models, Scenario Generation, Resilience Analysis）
+
+JSONのみを出力してください（説明文は不要）。
 """
     
     try:
-        response = pro_model.generate_content(prompt)
-        return response.text
+        response = model.generate_content(prompt)
+        result_text = response.text.strip()
+        
+        # Extract JSON from response (handle markdown code blocks)
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in result_text:
+            result_text = result_text.split("```")[1].split("```")[0].strip()
+        
+        # Parse JSON
+        result = json.loads(result_text)
+        
+        # Validate required keys
+        required_keys = ["score", "novelty", "category"]
+        if not all(key in result for key in required_keys):
+            raise ValueError(f"Missing required keys. Expected: {required_keys}")
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse JSON from Gemini response: {e}\nResponse: {result_text}")
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-            import re
-            retry_match = re.search(r'retry in (\d+\.?\d*)', error_msg)
-            suggested_wait = int(float(retry_match.group(1))) if retry_match else RETRY_WAIT_SECONDS
-            st.warning(f"⏳ Pro model rate limit: Will retry in {max(suggested_wait, RETRY_WAIT_SECONDS)}s...")
-            raise  # Let tenacity handle retry
-        raise RuntimeError(f"Pro model error: {e}")
+        raise RuntimeError(f"Gemini API error: {e}")
 
 
-@retry(
-    retry=retry_if_exception_type(Exception),
-    stop=stop_after_attempt(MAX_RETRIES),
-    wait=wait_fixed(RETRY_WAIT_SECONDS),
-    reraise=True
-)
-def generate_slides(extracted_info: str, api_key: str, title: str, authors: str) -> str:
+def summarize_paper(text: str, api_key: str, title: str) -> str:
     """
-    Stage 2: Generate Marp-compatible slide deck using Pro model with retry logic.
+    Generate detailed summary in markdown format.
     
     Args:
-        extracted_info: Information extracted in Stage 1
+        text: Paper content in markdown
+        api_key: Gemini API key
+        title: Paper title
+    
+    Returns:
+        Markdown summary
+    """
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    
+    prompt = f"""
+# Role
+あなたは論文の査読経験が豊富なシニアリサーチャーです。
+
+# Goal
+提供された論文テキストを読み込み、以下のフォーマットに従って重要事項を構造化して出力してください。
+私がこの論文を詳細に読むべきか、自分の研究に取り入れるべきかを判断するための材料とします。
+
+# Title
+{title}
+
+# Input Text
+{text[:80000]}
+
+# Constraints
+* 出力は日本語で行ってください。
+* 抽象的な表現は避け、具体的な数値や手法名を用いてください。
+* 著者の主張を鵜呑みにせず、客観的な視点を維持してください。
+
+# Output Format (Markdown)
+
+## 1. どんなもの？ (Overview)
+* 一言でいうと：
+* 解決したい課題：
+
+## 2. 先行研究と比べてどこがすごい？ (Novelty & Difference)
+* 既存手法の限界：
+* この研究の独自の提案・アイディア：
+
+## 3. 技術や手法のキモはどこ？ (Methodology)
+* 使用したモデル/アルゴリズム：
+* データの種類と規模：
+* 特筆すべき工夫点：
+
+## 4. どうやって有効性を検証した？ (Evaluation)
+* 比較対象（Baseline）：
+* 評価指標（Metrics）：
+* 結果（数値で）：
+
+## 5. 議論・課題はある？ (Discussion & Limitations)
+* この手法がうまくいかないケース：
+* 著者が挙げている課題（Future Work）：
+* （あなたの視点での）懸念点：
+"""
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        raise RuntimeError(f"Gemini API error: {e}")
+
+
+def generate_slides(text: str, api_key: str, title: str, authors: str) -> str:
+    """
+    Generate Marp-compatible slide deck.
+    
+    Args:
+        text: Paper content in markdown
         api_key: Gemini API key
         title: Paper title
         authors: Paper authors
@@ -346,15 +361,26 @@ def generate_slides(extracted_info: str, api_key: str, title: str, authors: str)
         Marp markdown slides
     """
     genai.configure(api_key=api_key)
-    pro_model = genai.GenerativeModel(PRO_MODEL)
+    model = genai.GenerativeModel(GEMINI_MODEL)
     
     prompt = f"""
 あなたは学術プレゼンテーションスライドの専門家です。
 
-以下の論文情報から、Marp形式のスライド（5-8枚）を作成してください。
+以下の論文からMarp形式のスライド（5-8枚）を作成してください。
+
+## 論文タイトル
+{title}
+
+## 著者
+{authors}
+
+## 論文内容
+{text[:80000]}
+
+---
 
 ## スライド構成
-1. タイトルスライド（タイトル、著者）
+1. タイトルスライド
 2. 背景と課題
 3. 提案手法
 4. 実験結果
@@ -363,43 +389,301 @@ def generate_slides(extracted_info: str, api_key: str, title: str, authors: str)
 ## ルール
 - `---` でスライドを区切る
 - ヘッダーに `marp: true` を含める
-- 箇条書きを使用（段落は避ける）
-- テキストは簡潔に
-- 数式や重要な数値を含める
-
----
-
-## 論文タイトル
-{title}
-
-## 著者
-{authors}
-
-## 抽出された詳細情報
-
-{extracted_info}
-
----
+- 箇条書きを使用
+- 簡潔に
 
 Marpスライドを生成してください。
 """
     
     try:
-        response = pro_model.generate_content(prompt)
+        response = model.generate_content(prompt)
         slide_text = response.text
-        # Ensure marp header is present
         if "marp:" not in slide_text[:100]:
             slide_text = "---\nmarp: true\ntheme: default\n---\n\n" + slide_text
         return slide_text
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
-            import re
-            retry_match = re.search(r'retry in (\d+\.?\d*)', error_msg)
-            suggested_wait = int(float(retry_match.group(1))) if retry_match else RETRY_WAIT_SECONDS
-            st.warning(f"⏳ Pro model rate limit: Will retry in {max(suggested_wait, RETRY_WAIT_SECONDS)}s...")
-            raise  # Let tenacity handle retry
-        raise RuntimeError(f"Pro model error: {e}")
+        raise RuntimeError(f"Gemini API error: {e}")
+
+
+def markdown_to_notion_blocks(markdown_text: str) -> list:
+    """
+    Convert Markdown text to Notion block objects with nested list support.
+    
+    Supports:
+    - ## headings -> heading_2
+    - ### headings -> heading_3
+    - * or - bullet points -> bulleted_list_item (with nesting via indentation)
+    - **bold** text -> annotations with bold
+    - Regular paragraphs -> paragraph
+    
+    Args:
+        markdown_text: Markdown formatted text
+    
+    Returns:
+        List of Notion block objects
+    """
+    blocks = []
+    lines = markdown_text.split('\n')
+    
+    def parse_inline_formatting(text: str) -> list:
+        """Parse **bold** formatting and return rich_text array."""
+        rich_text = []
+        parts = re.split(r'(\*\*[^*]+\*\*)', text)
+        
+        for part in parts:
+            if not part:
+                continue
+            
+            if part.startswith('**') and part.endswith('**'):
+                # Bold text
+                content = part[2:-2]
+                if content:
+                    rich_text.append({
+                        "type": "text",
+                        "text": {"content": content},
+                        "annotations": {"bold": True}
+                    })
+            else:
+                # Regular text
+                if part:
+                    rich_text.append({
+                        "type": "text",
+                        "text": {"content": part}
+                    })
+        
+        return rich_text if rich_text else [{"type": "text", "text": {"content": text}}]
+    
+    def get_indent_level(line: str) -> int:
+        """Calculate indentation level (number of leading spaces divided by 4)."""
+        return (len(line) - len(line.lstrip())) // 4
+    
+    # Stack to track parent list items by indent level
+    # Format: {indent_level: block_reference}
+    parent_stack = {}
+    
+    for line in lines:
+        if not line.strip():
+            continue  # Skip empty lines
+        
+        # Heading 3 (###)
+        if line.startswith('### '):
+            heading_text = line[4:].strip()
+            rich_text = parse_inline_formatting(heading_text)
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text}
+            })
+            parent_stack.clear()  # Reset stack on non-list items
+        
+        # Heading 2 (##)
+        elif line.startswith('## '):
+            heading_text = line[3:].strip()
+            rich_text = parse_inline_formatting(heading_text)
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": rich_text}
+            })
+            parent_stack.clear()  # Reset stack on non-list items
+        
+        # Heading 1 (#)
+        elif line.startswith('# ') and not line.startswith('##'):
+            heading_text = line[2:].strip()
+            rich_text = parse_inline_formatting(heading_text)
+            blocks.append({
+                "object": "block",
+                "type": "heading_1",
+                "heading_1": {"rich_text": rich_text}
+            })
+            parent_stack.clear()  # Reset stack on non-list items
+        
+        # Bulleted list (* or -)
+        elif line.strip().startswith('* ') or line.strip().startswith('- '):
+            indent_level = get_indent_level(line)
+            bullet_text = line.strip()[2:].strip()
+            rich_text = parse_inline_formatting(bullet_text)
+            
+            new_block = {
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": rich_text}
+            }
+            
+            # Determine where to add this block
+            if indent_level == 0:
+                # Top-level item
+                blocks.append(new_block)
+                parent_stack = {0: new_block}  # Reset stack to this item
+            else:
+                # Nested item - find parent
+                parent_level = indent_level - 1
+                
+                # Find the closest parent at a lower indent level
+                while parent_level >= 0 and parent_level not in parent_stack:
+                    parent_level -= 1
+                
+                if parent_level >= 0 and parent_level in parent_stack:
+                    # Add as child of parent
+                    parent_block = parent_stack[parent_level]
+                    
+                    # Ensure parent has children array
+                    if "children" not in parent_block["bulleted_list_item"]:
+                        parent_block["bulleted_list_item"]["children"] = []
+                    
+                    parent_block["bulleted_list_item"]["children"].append(new_block)
+                else:
+                    # No valid parent found, add to top level
+                    blocks.append(new_block)
+                
+                # Update stack with current item
+                parent_stack[indent_level] = new_block
+                
+                # Remove deeper levels from stack
+                keys_to_remove = [k for k in parent_stack.keys() if k > indent_level]
+                for k in keys_to_remove:
+                    del parent_stack[k]
+        
+        # Regular paragraph
+        else:
+            rich_text = parse_inline_formatting(line.strip())
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": rich_text}
+            })
+            parent_stack.clear()  # Reset stack on non-list items
+    
+    return blocks
+
+
+def update_notion_page(title: str, ai_result: Dict, notion_token: str, database_id: str, summary: str = "") -> bool:
+    """
+    Update Notion page with AI analysis results and summary content.
+    
+    Args:
+        title: Paper title to search for
+        ai_result: Dictionary with 'score', 'novelty', 'category' keys
+        notion_token: Notion API token
+        database_id: Notion database ID
+        summary: Optional markdown summary to append to page body
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not notion_token or not database_id:
+        st.warning("⚠️ Notion credentials not configured. Skipping Notion update.")
+        return False
+    
+    try:
+        notion = Client(auth=notion_token)
+        
+        # Step 1: Search for page by title
+        st.info(f"🔍 Searching Notion for: {title}")
+        
+        search_results = notion.data_sources.query(
+            data_source_id=database_id,
+            filter={
+                "property": "Title",
+                "title": {
+                    "equals": title
+                }
+            }
+        )
+        
+        if not search_results["results"]:
+            st.warning(f"⚠️ No Notion page found for: {title}")
+            return False
+        
+        page_id = search_results["results"][0]["id"]
+        st.success(f"✅ Found Notion page: {page_id[:8]}...")
+        
+        # Step 2: Update page properties
+        st.info("📝 Updating Notion page...")
+        
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "AI Score": {
+                    "number": int(ai_result.get("score", 0))
+                },
+                "Novelty": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": str(ai_result.get("novelty", ""))[:2000]
+                            }
+                        }
+                    ]
+                },
+                "Category": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": str(ai_result.get("category", ""))[:2000]
+                            }
+                        }
+                    ]
+                }
+            }
+        )
+        
+        st.success(f"✅ Notion page properties updated!")
+        
+        # Step 3: Append summary to page body if provided
+        if summary:
+            st.info("📝 Appending summary to page body...")
+            
+            # Convert markdown summary to Notion blocks
+            summary_blocks = []
+            
+            # Add a divider
+            summary_blocks.append({
+                "object": "block",
+                "type": "divider",
+                "divider": {}
+            })
+            
+            # Add heading
+            summary_blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {"content": "🤖 AI Generated Summary"}
+                    }]
+                }
+            })
+            
+            # Add summary as paragraph blocks (preserves markdown as plain text)
+            # Split by character limit (2000 chars per block)
+            # Convert markdown to properly formatted Notion blocks
+            converted_blocks = markdown_to_notion_blocks(summary)
+            summary_blocks.extend(converted_blocks)
+            
+            # Notion API has a limit of 100 blocks per append call
+            # Split into chunks if necessary
+            chunk_size = 100
+            for i in range(0, len(summary_blocks), chunk_size):
+                chunk = summary_blocks[i:i+chunk_size]
+                notion.blocks.children.append(
+                    block_id=page_id,
+                    children=chunk
+                )
+            
+            st.success(f"✅ Summary appended to page ({len(converted_blocks)} blocks)")
+        
+        st.success(f"✅ Notion page fully updated!")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Notion update failed: {e}")
+        import traceback
+        st.code(traceback.format_exc(), language="python")
+        return False
 
 
 def safe_filename(name: str) -> str:
@@ -439,13 +723,14 @@ def main():
         layout="wide"
     )
     
-    st.title("📚 Paper Summarizer with Zotero")
+    st.title("📚 Paper Summarizer with Zotero + Notion")
     st.markdown("""
     Select papers from your Zotero collections and generate AI-powered summaries and slides.
     
-    **🚀 Two-Stage AI Processing:**
-    - **Stage 1 (Flash):** High-speed detailed information extraction
-    - **Stage 2 (Pro):** Advanced reasoning with automatic retry for rate limits
+    **🚀 Features:**
+    - **AI Analysis:** Gemini 1.5 Flash for cost-efficient analysis
+    - **Notion Integration:** Auto-update Notion database with AI scores
+    - **Rate Limit Protection:** 4-second delay between API calls
     """)
     
     # ========== Sidebar: Configuration ==========
@@ -470,6 +755,25 @@ def main():
             type="password"
         )
         
+        st.divider()
+        
+        st.subheader("🔗 Notion Integration")
+        
+        notion_token = st.text_input(
+            "Notion Token",
+            value=NOTION_TOKEN,
+            type="password",
+            help="Notion API token (optional)"
+        )
+        
+        notion_database_id = st.text_input(
+            "Notion Database ID",
+            value=NOTION_DATABASE_ID,
+            help="Notion database ID (optional)"
+        )
+        
+        st.divider()
+        
         storage_path = st.text_input(
             "Local Zotero Storage Path",
             value=DEFAULT_ZOTERO_STORAGE,
@@ -486,11 +790,9 @@ def main():
         
         # Model information
         st.subheader("🤖 AI Model")
-        st.caption(f"**Stage 1:** {FLASH_MODEL}")
-        st.caption("Fast information extraction (50s retry)")
-        st.caption(f"**Stage 2:** {PRO_MODEL}")
-        st.caption(f"Advanced reasoning (50s retry)")
-        st.info("⚠️ Both models have rate limits. Auto-retry with 50s wait on quota errors.")
+        st.caption(f"**Model:** {GEMINI_MODEL}")
+        st.caption(f"**Rate Limit:** {RATE_LIMIT_DELAY}s delay between calls")
+        st.info("💡 Cost-efficient single-stage processing")
         
         st.divider()
         
@@ -611,24 +913,34 @@ def main():
                 # Clean text
                 cleaned_text = clean_text(md_text)
                 
-                # Stage 1: Extract high-resolution information (Flash model)
-                with st.spinner(f"🔍 Stage 1: Extracting detailed information ({FLASH_MODEL})..."):
-                    extracted_info = extract_paper_info(cleaned_text, gemini_api_key, paper["title"])
+                # AI Analysis for Notion
+                with st.spinner(f"🤖 Analyzing paper with {GEMINI_MODEL}..."):
+                    ai_result = analyze_paper_with_gemini(cleaned_text, gemini_api_key, paper["title"])
                 
-                st.info(f"✅ Stage 1 complete. Extracted {len(extracted_info)} characters.")
+                st.success(f"✅ AI Analysis complete: Score={ai_result.get('score')}, Category={ai_result.get('category')}")
                 
-                # Stage 2: Generate outputs based on mode (Pro model with retry)
+                # Generate outputs based on mode
                 summary = None
                 slides = None
                 
                 if output_mode in ["Both (Summary + Slides)", "Summary Only"]:
-                    with st.spinner(f"📝 Stage 2: Generating summary ({PRO_MODEL})..."):
-                        summary = summarize_paper(extracted_info, gemini_api_key, paper["title"])
+                    with st.spinner(f"📝 Generating summary..."):
+                        summary = summarize_paper(cleaned_text, gemini_api_key, paper["title"])
+                
+                # Update Notion if credentials provided (after generating summary)
+                if notion_token and notion_database_id:
+                    update_notion_page(
+                        paper["title"], 
+                        ai_result, 
+                        notion_token, 
+                        notion_database_id,
+                        summary=summary or ""  # Pass summary to write to page body
+                    )
                 
                 if output_mode in ["Both (Summary + Slides)", "Slides Only"]:
-                    with st.spinner(f"🎞️ Stage 2: Generating slides ({PRO_MODEL})..."):
+                    with st.spinner(f"🎞️ Generating slides..."):
                         slides = generate_slides(
-                            extracted_info, 
+                            cleaned_text, 
                             gemini_api_key, 
                             paper["title"],
                             paper["authors"]
@@ -645,6 +957,7 @@ def main():
                     results.append({
                         "paper": paper,
                         "status": "success",
+                        "ai_result": ai_result,
                         "summary": summary,
                         "slides": slides,
                         "summary_path": summary_path if summary else None,
@@ -662,6 +975,11 @@ def main():
                 })
             
             progress_bar.progress((idx + 1) / len(selected_papers))
+            
+            # Rate limit protection: wait before next iteration
+            if idx < len(selected_papers) - 1:  # Don't wait after last paper
+                st.info(f"⏳ Waiting {RATE_LIMIT_DELAY}s to avoid rate limits...")
+                time.sleep(RATE_LIMIT_DELAY)
         
         status_text.text("✅ All papers processed!")
         st.session_state["results"] = results
@@ -675,6 +993,20 @@ def main():
             
             if result["status"] == "success":
                 with st.expander(f"✅ {paper['title']}", expanded=False):
+                    
+                    # AI Analysis Results
+                    if result.get("ai_result"):
+                        st.subheader("🤖 AI Analysis")
+                        ai_res = result["ai_result"]
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("AI Score", ai_res.get("score", "N/A"))
+                        with col2:
+                            st.metric("Category", ai_res.get("category", "N/A"))
+                        st.write("**Novelty:**")
+                        st.write(ai_res.get("novelty", "N/A"))
+                    
+                    st.divider()
                     
                     # Summary preview
                     if result.get("summary"):

@@ -1,16 +1,18 @@
-# 📚 Paper Summarizer - Zotero + Gemini
+# 📚 Paper Summarizer - Zotero + Gemini + Notion
 
-研究者のための論文要約GUIアプリケーション。Zoteroで管理している論文PDFを一括で要約し、プレゼンテーション用スライド（Marp形式）を自動生成します。
+研究者のための論文要約GUIアプリケーション。Zoteroで管理している論文PDFを一括で要約し、Notion データベースに自動的に結果を反映します。
 
 ## ✨ Features
 
 - 🔗 **Zotero統合**: Zoteroコレクションから論文を直接取得
 - 📄 **PDF解析**: PyMuPDF4LLMでPDFをMarkdownに変換
 - 🧹 **自動クリーニング**: 参考文献セクションを自動除去
-- 🤖 **AI要約**: Gemini 1.5 Proによる詳細な論文要約
+- 🤖 **AI分析**: Gemini 1.5 Flashによるコスト効率的な論文分析
+- 🗄️ **Notion統合**: AI分析結果を自動的にNotionデータベースに反映
 - 🎞️ **スライド生成**: Marp形式のプレゼンテーションスライドを自動作成
 - 💾 **バッチ処理**: 複数の論文を一度に処理可能
 - 📊 **リアルタイム進捗**: プログレスバーで処理状況を表示
+- ⏱️ **レート制限保護**: API呼び出し間に4秒の遅延を挿入
 
 ## 🛠️ Tech Stack
 
@@ -18,7 +20,8 @@
 - **GUI Framework:** Streamlit
 - **Zotero API:** pyzotero
 - **PDF Parsing:** pymupdf4llm
-- **LLM API:** google-generativeai (Gemini 1.5 Pro)
+- **LLM API:** google-generativeai (Gemini 1.5 Flash)
+- **Notion API:** notion-client
 - **Environment:** python-dotenv
 
 ## 📦 Installation
@@ -40,7 +43,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 cd C:\Users\echiz\00_研究コード\99_PaperReader
 
 # 依存関係のインストール（既に完了している場合はスキップ可）
-uv add streamlit pyzotero pymupdf4llm google-generativeai python-dotenv
+uv add streamlit pyzotero pymupdf4llm google-generativeai python-dotenv notion-client
 ```
 
 ### 3. 環境変数の設定
@@ -58,6 +61,10 @@ ZOTERO_LIBRARY_ID=your_library_id_here
 ZOTERO_API_KEY=your_zotero_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 ZOTERO_STORAGE_PATH=C:\Users\YourUsername\Zotero\storage
+
+# Notion統合（オプション - 空欄のままでもアプリは動作します）
+NOTION_TOKEN=your_notion_integration_token_here
+NOTION_DATABASE_ID=your_notion_database_id_here
 ```
 
 #### Zotero API Keyの取得方法
@@ -79,6 +86,36 @@ Zoteroアプリで:
 2. "Data Directory Location" を確認
 3. `storage` フォルダのパスをコピー（例: `C:\Users\YourName\Zotero\storage`）
 
+#### Notion統合の設定方法（オプション）
+
+**前提条件**: Zotero→Notion同期には[Notero](https://github.com/dvanoni/notero)プラグインを推奨します。NoteroがZoteroの論文をNotionデータベースに自動同期します。
+
+1. **Notion Integrationの作成**
+   - [Notion Integrations](https://www.notion.so/my-integrations) にアクセス
+   - "New integration" をクリック
+   - Integration名を入力（例: "Paper Analyzer"）
+   - "Submit" をクリック
+   - **Internal Integration Token**をコピー（`NOTION_TOKEN` として使用）
+
+2. **Notion Database IDの取得**
+   - Notionで論文管理用データベースを開く
+   - URLから Database IDをコピー:
+     ```
+     https://www.notion.so/workspace/DATABASE_ID?v=...
+     ↑ この部分をコピー
+     ```
+
+3. **Integrationにデータベースへのアクセス権を付与**
+   - Notionでデータベースページを開く
+   - 右上の "..." メニュー → "Connections" → 作成したIntegrationを選択
+
+4. **必要なプロパティの追加**
+   - Notionデータベースに以下のプロパティを追加:
+     - `Name` (Title) - 論文タイトル（Noteroが自動作成）
+     - `AI Score` (Number) - AIによる評価スコア（0-100）
+     - `Novelty` (Rich Text) - 新規性の説明
+     - `Category` (Rich Text) - 論文のカテゴリ
+
 ## 🚀 Usage
 
 ### アプリの起動
@@ -93,6 +130,7 @@ uv run streamlit run app.py
 
 1. **サイドバーで設定**
    - Zotero Library ID、API Key、Gemini API Keyを入力
+   - （オプション）Notion TokenとDatabase IDを入力
    - Local Zotero Storage Pathを確認・修正
    - Output Mode（Summary + Slides / Summary Only / Slides Only）を選択
 
@@ -107,9 +145,11 @@ uv run streamlit run app.py
 4. **要約を実行**
    - "Start Summarization" ボタンをクリック
    - 進捗バーで処理状況を確認
+   - **AI分析結果が自動的にNotionデータベースに反映されます**（Notion設定済みの場合）
 
 5. **結果を確認**
    - 生成された要約とスライドをExpanderで確認
+   - AI Score、Novelty、Categoryの分析結果を表示
    - `./output/{論文タイトル}/` に保存されたファイルを開く
 
 ## 📂 Output Structure
