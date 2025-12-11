@@ -32,7 +32,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Model configuration (simplified to single-stage)
 GEMINI_MODEL = "gemini-flash-lite-latest"  # Cost-efficient model
-GEMINI_MODEL = "gemini-2.5-flash-tts"  # Cost-efficient model
+# GEMINI_MODEL = "gemini-2.5-flash-tts"  # Cost-efficient model
 RATE_LIMIT_DELAY = 4  # seconds between API calls
 
 # Notion configuration

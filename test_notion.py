@@ -141,52 +141,32 @@ def update_notion_page(title: str, ai_result: dict, notion_token: str, database_
                 }
             })
             
-            # Add summary in a collapsible toggle block for cleaner appearance
+            # Add entire summary as a single code block to preserve markdown formatting
             summary_blocks.append({
                 "object": "block",
-                "type": "toggle",
-                "toggle": {
+                "type": "code",
+                "code": {
                     "rich_text": [{
                         "type": "text",
-                        "text": {"content": "詳細要約を表示 ▶"}
+                        "text": {"content": summary[:2000] if len(summary) <= 2000 else summary[:2000]}
                     }],
-                    "children": [{
-                        "object": "block",
-                        "type": "code",
-                        "code": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": summary[:2000] if len(summary) <= 2000 else summary[:2000]}
-                            }],
-                            "language": "markdown"
-                        }
-                    }]
+                    "language": "markdown"
                 }
             })
             
             # If summary is longer than 2000 chars, add continuation blocks
             if len(summary) > 2000:
                 chunks = [summary[i:i+2000] for i in range(2000, len(summary), 2000)]
-                for idx, chunk in enumerate(chunks, 2):
+                for chunk in chunks:
                     summary_blocks.append({
                         "object": "block",
-                        "type": "toggle",
-                        "toggle": {
+                        "type": "code",
+                        "code": {
                             "rich_text": [{
                                 "type": "text",
-                                "text": {"content": f"詳細要約 (続き {idx}) ▶"}
+                                "text": {"content": chunk}
                             }],
-                            "children": [{
-                                "object": "block",
-                                "type": "code",
-                                "code": {
-                                    "rich_text": [{
-                                        "type": "text",
-                                        "text": {"content": chunk}
-                                    }],
-                                    "language": "markdown"
-                                }
-                            }]
+                            "language": "markdown"
                         }
                     })
             
